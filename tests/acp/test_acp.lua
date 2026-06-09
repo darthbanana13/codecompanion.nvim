@@ -299,6 +299,81 @@ T["ACP Connection"]["use_session restores the model of the session it switches b
   h.eq("opus", result)
 end
 
+T["ACP Connection"]["legacy models are stored and changed per session"] = function()
+  local result = child.lua([[
+    local connection = create_init_connection()
+    local calls = {}
+    function connection:send_rpc_request(method, params)
+      table.insert(calls, { method = method, params = params })
+      if method == "initialize" then
+        return { protocolVersion = 1, authMethods = {}, agentCapabilities = { loadSession = true } }
+      elseif method == "session/new" then
+        return {
+          sessionId = "first",
+          models = {
+            currentModelId = "opus",
+            availableModels = { { modelId = "opus", name = "Opus" }, { modelId = "haiku", name = "Haiku" } },
+          },
+        }
+      elseif method == "session/load" then
+        return { models = { currentModelId = "other", availableModels = { { modelId = "other", name = "Other" } } } }
+      elseif method == "session/set_model" then
+        return {}
+      end
+    end
+
+    local connected = connection:connect_and_initialize() ~= nil
+    local initial = connection:get_models().currentModelId
+    local invalid = connection:set_model("missing")
+    local unchanged = connection:set_model("opus")
+    local changed = connection:set_model("haiku")
+    local request = calls[#calls]
+    local loaded = connection:load_session("second")
+    local second = connection:get_models().currentModelId
+    connection:use_session("first")
+    local restored = connection:get_models().currentModelId
+    connection:use_session(nil)
+    local empty = connection:get_models() == nil
+    return { connected = connected, initial = initial, invalid = invalid, unchanged = unchanged, changed = changed,
+      request = request, loaded = loaded, second = second, restored = restored, empty = empty }
+  ]])
+
+  h.eq(result.connected, true)
+  h.eq(result.initial, "opus")
+  h.eq(result.invalid, false)
+  h.eq(result.unchanged, false)
+  h.eq(result.changed, true)
+  h.eq(result.request, { method = "session/set_model", params = { sessionId = "first", modelId = "haiku" } })
+  h.eq(result.loaded, true)
+  h.eq(result.second, "other")
+  h.eq(result.restored, "haiku")
+  h.eq(result.empty, true)
+end
+
+T["ACP Connection"]["model config options take precedence over legacy models"] = function()
+  local result = child.lua([[
+    local connection = create_init_connection()
+    connection.session_id = "first"
+    connection._models = { currentModelId = "legacy", availableModels = {} }
+    connection:_apply_config_options({ {
+      type = "select", id = "model", category = "model", currentValue = "modern",
+      options = { { value = "modern", name = "Modern" }, { value = "next", name = "Next" } },
+    } })
+    local request
+    function connection:send_rpc_request(method, params)
+      request = { method = method, params = params }
+      return {}
+    end
+    local current = connection:get_models().currentModelId
+    local changed = connection:set_model("next")
+    return { current = current, changed = changed, request = request }
+  ]])
+
+  h.eq(result.current, "modern")
+  h.eq(result.changed, true)
+  h.eq(result.request, { method = "session/set_config_option", params = { sessionId = "first", configId = "model", value = "next" } })
+end
+
 T["ACP Connection"]["falls back to session/new if session/load fails"] = function()
   local result = child.lua([[
     local calls = {}

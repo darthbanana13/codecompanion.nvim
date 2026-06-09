@@ -63,6 +63,8 @@ local uv = vim.uv
 ---@field _session_config_options table<string, table[]> The configOptions of each session, restored when switching back to it
 ---@field _in_flight table<string, CodeCompanion.ACP.Connection.InFlight> Establishment steps currently underway
 ---@field _system_prompt_notified? boolean
+---@field _models table|nil Legacy models for the current session
+---@field _session_models table<string, table> Legacy models for each session
 ---@field _pending_callbacks table<number, function> Async callbacks keyed by request ID
 ---@field _rpc_log? { path: string, write: fun(data: string) } Per-connection log capturing raw JSON-RPC traffic
 ---@field methods table
@@ -112,8 +114,10 @@ function Connection.new(args)
     _config_options = {},
     _in_flight = {},
     _initialized = false,
+    _models = nil,
     _pending_callbacks = {},
     _session_config_options = {},
+    _session_models = {},
     _state = { handle = nil, id_gen = jsonrpc.IdGenerator.new(), line_buffer = jsonrpc.LineBuffer.new() },
   }, { __index = Connection }) ---@cast self CodeCompanion.ACP.Connection
 
@@ -330,6 +334,7 @@ end
 function Connection:use_session(session_id)
   self.session_id = session_id
   self._config_options = self._session_config_options[session_id] or {}
+  self._models = self._session_models[session_id]
 end
 
 ---Create or load the session, announcing it to listeners
@@ -426,7 +431,7 @@ function Connection:load_session(session_id, opts)
     return false
   end
 
-  self.session_id = session_id
+  self:use_session(session_id)
   self._loading_session = true
   self._on_session_update = opts.on_session_update
 
@@ -536,6 +541,11 @@ function Connection:_establish_session()
     if opts.session_data.configOptions then
       self:_apply_config_options(opts.session_data.configOptions)
       log:debug("[acp::_establish_session] %s config options applied", opts.source)
+    end
+    self._models = opts.session_data.models
+    self._session_models[self.session_id] = self._models
+    if self._models then
+      log:debug("[acp::_establish_session] %s models: %s", opts.source, self._models)
     end
   end
 
@@ -1037,6 +1047,8 @@ function Connection:handle_process_exit(code, signal)
   self.adapter_modified = nil
   self._authenticated = false
   self._initialized = false
+  self._models = nil
+  self._session_models = {}
   self._pending_callbacks = {}
   self.pending_responses = {}
   self.session_id = nil
@@ -1063,31 +1075,71 @@ end
 ---@return table|nil models {currentModelId: string, availableModels: table[]} or nil
 function Connection:get_models()
   local opt = self:_find_config_option("model")
-  if not opt then
-    return nil
+  if opt then
+    local available = vim.tbl_map(function(val)
+      return { modelId = val.value, name = val.name }
+    end, Connection.flatten_config_options(opt.options or {}))
+
+    return {
+      availableModels = available,
+      currentModelId = opt.currentValue,
+    }
   end
 
-  local available = vim.tbl_map(function(val)
-    return { modelId = val.value, name = val.name }
-  end, Connection.flatten_config_options(opt.options or {}))
-
-  return {
-    availableModels = available,
-    currentModelId = opt.currentValue,
-  }
+  -- Fallback to legacy _models field (e.g. kiro)
+  return self._models
 end
 
----Set a model via session/set_config_option
+---Set a model via session/set_config_option or legacy session/set_model
 ---@param model_id string
 ---@return boolean success
 function Connection:set_model(model_id)
   local opt = self:_find_config_option("model")
-  if not opt then
+  if opt then
+    return self:set_config_option(opt.id, model_id)
+  end
+
+  -- Fallback to legacy session/set_model (e.g. kiro)
+  if not self._models then
     log:error("[acp::set_model] Agent does not support changing models")
     return false
   end
 
-  return self:set_config_option(opt.id, model_id)
+  if not self.session_id then
+    log:error("[acp::set_model] Connection not established")
+    return false
+  end
+
+  local valid = false
+  for _, model in ipairs(self._models.availableModels or {}) do
+    if model.modelId == model_id then
+      valid = true
+      break
+    end
+  end
+
+  if not valid then
+    log:error("[acp::set_model] Invalid model ID: %s", model_id)
+    return false
+  end
+
+  if model_id == self._models.currentModelId then
+    return false
+  end
+
+  local ok = self:send_rpc_request(METHODS.SESSION_SET_MODEL, {
+    modelId = model_id,
+    sessionId = self.session_id,
+  })
+
+  if not ok then
+    log:error("[acp::set_model] Failed to set model to %s", model_id)
+    return false
+  end
+
+  self._models.currentModelId = model_id
+  log:debug("[acp::set_model] Changed model to %s", model_id)
+  return true
 end
 
 ---Get all config options, optionally excluding certain categories
